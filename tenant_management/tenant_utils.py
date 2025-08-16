@@ -12,6 +12,8 @@ import secrets
 import string
 import requests
 import logging
+from psycopg2 import sql
+
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,11 @@ def generate_database_credentials(tenant_slug):
 
 
 def create_postgresql_database(db_name, db_user, db_password):
-    """Create PostgreSQL database and user"""
+    """
+    Idempotent: create-if-missing user & database, no drops.
+    - If role exists: ALTER ROLE to (re)set password & LOGIN
+    - If DB exists: ensure owner is db_user and grant privileges
+    """
     conn = psycopg2.connect(
         host=settings.DATABASES['default']['HOST'],
         port=settings.DATABASES['default']['PORT'],
@@ -36,22 +42,65 @@ def create_postgresql_database(db_name, db_user, db_password):
     )
     conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
     cursor = conn.cursor()
-    
+
     try:
-        # Drop existing user and database (for clean recreation)
-        cursor.execute(f"DROP USER IF EXISTS {db_user};")
-        cursor.execute(f"DROP DATABASE IF EXISTS {db_name};")
-        
-        # Create new user and database
-        cursor.execute(f"CREATE USER {db_user} WITH PASSWORD %s;", (db_password,))
-        cursor.execute(f"CREATE DATABASE {db_name} OWNER {db_user};")
-        cursor.execute(f"GRANT ALL PRIVILEGES ON DATABASE {db_name} TO {db_user};")
-        
-        print(f"✅ Created database: {db_name}")
-        print(f"✅ Created user: {db_user}")
-        
+        # 1) ROLE / USER
+        cursor.execute("SELECT 1 FROM pg_roles WHERE rolname=%s;", (db_user,))
+        role_exists = cursor.fetchone() is not None
+
+        if not role_exists:
+            cursor.execute(
+                sql.SQL("CREATE USER {} WITH PASSWORD %s")
+                .format(sql.Identifier(db_user)),
+                (db_password,)
+            )
+
+            print(f"✅ Created database user: {db_user}")
+        else:
+            cursor.execute(
+                sql.SQL("ALTER ROLE {} WITH LOGIN PASSWORD %s")
+                .format(sql.Identifier(db_user)),
+                (db_password,)
+            )
+
+            print(f"🔁 Updated password for user: {db_user}")
+
+        # 2) DATABASE
+        cursor.execute("SELECT 1 FROM pg_database WHERE datname=%s;", (db_name,))
+        db_exists = cursor.fetchone() is not None
+
+        if not db_exists:
+            cursor.execute(
+                    sql.SQL("CREATE DATABASE {} OWNER {}")
+                    .format(sql.Identifier(db_name), sql.Identifier(db_user))
+                )
+
+            print(f"✅ Created database: {db_name}")
+        else:
+            # Ensure owner is correct (requires superuser)
+            cursor.execute("""
+                SELECT pg_catalog.pg_get_userbyid(datdba)
+                FROM pg_database WHERE datname=%s;
+            """, (db_name,))
+            current_owner = cursor.fetchone()[0]
+            if current_owner != db_user:
+                cursor.execute(
+                    sql.SQL("ALTER DATABASE {} OWNER TO {}")
+                    .format(sql.Identifier(db_name), sql.Identifier(db_user))
+                )
+
+                print(f"🔁 Changed owner of {db_name} to {db_user}")
+
+        # 3) privileges (harmless if re-run)
+        cursor.execute(
+            sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {}")
+            .format(sql.Identifier(db_name), sql.Identifier(db_user))
+        )
+
+        print(f"✅ Granted privileges to {db_user} on {db_name}")
+
     except Exception as e:
-        print(f"❌ Error creating database: {e}")
+        print(f"❌ Error creating/updating database: {e}")
         raise
     finally:
         cursor.close()
@@ -96,18 +145,25 @@ def load_all_tenant_databases():
     
     print("✅ All tenant databases loaded")
 
-
-def register_tenant_database(tenant_slug, company_name, subscription_plan='BASIC'):
-    """Register new tenant database in the system"""
+def register_tenant_database(tenant_slug, company_name, subscription_plan='BASIC', framework_ids=None):
+    """Register and provision a tenant database with step-by-step status/ledger."""
     print(f"\n🏗️  Creating tenant database for: {company_name} ({tenant_slug})")
-    
-    # Generate credentials
+
+    steps = {
+        'generate_credentials': None,
+        'directory_row': None,
+        'postgres_provision': None,
+        'django_alias': None,
+        'migrations': None,
+        'templates': None,
+        'final_status': None,
+    }
+
+    # 1) credentials
     db_name, db_user, db_password = generate_database_credentials(tenant_slug)
-    
-    # Create PostgreSQL database and user
-    create_postgresql_database(db_name, db_user, db_password)
-    
-    # Create tenant record
+    steps['generate_credentials'] = {'ok': True, 'db_name': db_name, 'db_user': db_user}
+
+    # 2) create directory row first, mark as PROVISIONING
     tenant_info = TenantDatabaseInfo(
         tenant_slug=tenant_slug,
         company_name=company_name,
@@ -115,31 +171,57 @@ def register_tenant_database(tenant_slug, company_name, subscription_plan='BASIC
         database_user=db_user,
         database_host=settings.DATABASES['default']['HOST'],
         database_port=settings.DATABASES['default']['PORT'],
-        subscription_plan=subscription_plan
+        subscription_plan=subscription_plan,
+        status='PROVISIONING',
+        is_active=True,
     )
-    
-    # Encrypt and save password
     tenant_info.encrypt_password(db_password)
     tenant_info.save()
-    
-    print(f"✅ Registered tenant: {tenant_slug}")
-    
-    # Add database to Django connections dynamically
-    connection_name = add_tenant_database_to_django(tenant_info)
-    
-    # Run migrations on tenant database via Service 1
-    migration_success = run_tenant_migrations_via_service1(tenant_slug, connection_name)
-    
-    # Copy templates via Service 1
-    template_success = copy_framework_templates_via_service1(tenant_slug)
-    
-    print(f"🎉 Tenant database setup complete for: {company_name}")
-    return {
-        'tenant_info': tenant_info,
-        'connection_name': connection_name,
-        'migration_success': migration_success,
-        'template_success': template_success
-    }
+    steps['directory_row'] = {'ok': True, 'id': str(tenant_info.id)}
+
+    try:
+        # 3) ensure postgres role/db
+        create_postgresql_database(db_name, db_user, db_password)
+        steps['postgres_provision'] = {'ok': True}
+
+        # 4) wire alias
+        connection_name = add_tenant_database_to_django(tenant_info)
+        steps['django_alias'] = {'ok': True, 'connection_name': connection_name}
+
+        # 5) migrations (service 1)
+        migration_success = run_tenant_migrations_via_service1(tenant_slug, connection_name)
+        steps['migrations'] = {'ok': bool(migration_success)}
+
+        # 6) template copy (service 1)
+        template_result = copy_framework_templates_via_service1(tenant_slug, framework_ids)
+        template_ok = bool(template_result) and template_result.get('success') is True
+        steps['templates'] = {'ok': template_ok, 'summary': template_result}
+
+        # 7) final status
+        all_ok = steps['postgres_provision']['ok'] and steps['django_alias']['ok'] and steps['migrations']['ok'] and steps['templates']['ok']
+        tenant_info.status = 'ACTIVE' if all_ok else 'PROVISIONING_FAILED'
+        tenant_info.save()
+        steps['final_status'] = tenant_info.status
+
+        print(f"🎉 Tenant database setup complete for: {company_name}")
+
+        return {
+            'tenant_info': tenant_info,
+            'connection_name': connection_name,
+            'migration_success': migration_success,
+            'template_success': template_result,
+            'steps': steps,
+        }
+
+    except Exception as e:
+        # on any exception mark failure
+        tenant_info.status = 'PROVISIONING_FAILED'
+        tenant_info.save()
+        steps['final_status'] = 'PROVISIONING_FAILED'
+        steps['error'] = str(e)
+        print(f"❌ Provisioning error: {e}")
+        # bubble up so the API returns 400 with the error
+        raise
 
 
 def run_tenant_migrations_via_service1(tenant_slug, connection_name):
@@ -148,15 +230,14 @@ def run_tenant_migrations_via_service1(tenant_slug, connection_name):
         print(f"📞 Calling Service 1 to run migrations for {tenant_slug}")
         
         # Call Service 1 API
+        service1 = settings.SERVICE1_URL.rstrip('/')
         response = requests.post(
-            'http://localhost:8000/api/v1/internal/migrate-tenant/',
-            json={
-                'tenant_slug': tenant_slug,
-                'connection_name': connection_name
-            },
-            headers={'X-Internal-Token': 'service2-secret'},  # TODO: Use proper auth
+            f'{service1}/api/v1/internal/migrate-tenant/',
+            json={'tenant_slug': tenant_slug, 'connection_name': connection_name},
+            headers={'X-Internal-Token': settings.INTERNAL_REGISTER_DB_TOKEN},
             timeout=30
         )
+
         
         if response.status_code == 200:
             print(f"✅ Migrations completed for {tenant_slug}")
@@ -176,16 +257,25 @@ def copy_framework_templates_via_service1(tenant_slug, framework_ids=None):
         print(f"📞 Calling Service 1 to copy templates to {tenant_slug}")
         
         # Call Service 1 API
+        # response = requests.post(
+        #     'http://localhost:8000/api/v1/internal/distribute-templates/',
+        #     json={
+        #         'tenant_slug': tenant_slug,
+        #         'framework_ids': framework_ids
+        #     },
+        #     headers={'X-Internal-Token': 'service2-secret'},  # TODO: Use proper auth
+        #     timeout=60
+        # )
+        
+        service1 = settings.SERVICE1_URL.rstrip('/')
         response = requests.post(
-            'http://localhost:8000/api/v1/internal/distribute-templates/',
-            json={
-                'tenant_slug': tenant_slug,
-                'framework_ids': framework_ids
-            },
-            headers={'X-Internal-Token': 'service2-secret'},  # TODO: Use proper auth
+            f'{service1}/api/v1/internal/distribute-templates/',
+            json={'tenant_slug': tenant_slug, 'framework_ids': framework_ids},
+            headers={'X-Internal-Token': settings.INTERNAL_REGISTER_DB_TOKEN},
             timeout=60
         )
-        
+
+
         if response.status_code == 200:
             result = response.json()
             print(f"✅ Templates copied to {tenant_slug}: {result.get('frameworks_copied', 0)} frameworks")

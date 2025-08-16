@@ -4,6 +4,9 @@ Django settings for user_management_service project.
 
 from pathlib import Path
 from decouple import config
+import os
+from datetime import timedelta
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -27,7 +30,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'django_filters',
     'drf_spectacular',
-    
+    'rest_framework_simplejwt.token_blacklist',
     # Local apps - will create these
     'tenant_management',
     'user_management', 
@@ -104,8 +107,15 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Django REST Framework settings
 REST_FRAMEWORK = {
+    # Require auth by default everywhere
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.AllowAny',  # For development
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        # JWT (SimpleJWT)
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        # Keep SessionAuth if you use the browsable API for admins
+        'rest_framework.authentication.SessionAuthentication',
     ],
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
@@ -116,8 +126,27 @@ REST_FRAMEWORK = {
         'rest_framework.filters.SearchFilter',
         'rest_framework.filters.OrderingFilter',
     ],
-    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(hours=24),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "ALGORITHM": "HS256",
+    # For dev only. In prod, validate against your IdP/JWKS or use a strong secret from env.
+    "SIGNING_KEY": config("JWT_SIGNING_KEY", default="dev-only-change-me"),
+    "AUTH_HEADER_TYPES": ("Bearer",),
+}
+
+from decouple import config  # or use os.environ.get
+
+INTERNAL_REGISTER_DB_TOKEN = config('INTERNAL_REGISTER_DB_TOKEN', default=None)
+SERVICE1_URL = config('SERVICE1_URL', default='http://localhost:8000')
+SERVICE2_URL = config('SERVICE2_URL', default='http://localhost:8001')
+
+
 
 # CORS settings
 CORS_ALLOWED_ORIGINS = [

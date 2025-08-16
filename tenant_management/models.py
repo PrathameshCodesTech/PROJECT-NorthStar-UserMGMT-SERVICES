@@ -9,6 +9,8 @@ from django.conf import settings
 import uuid
 import hashlib
 import base64
+from django.core.validators import RegexValidator
+
 
 
 class TenantDatabaseInfo(models.Model):
@@ -18,10 +20,15 @@ class TenantDatabaseInfo(models.Model):
     
     # Tenant identification
     tenant_slug = models.CharField(
-        max_length=50, 
-        unique=True,
-        help_text="URL-safe tenant identifier like 'techcorp', 'microsoft'"
+    max_length=50,
+    unique=True,
+    help_text="URL-safe tenant identifier like 'techcorp', 'microsoft'",
+    validators=[RegexValidator(
+        regex=r'^[a-z0-9-]{3,50}$',
+        message="tenant_slug must be 3–50 chars: lowercase letters, numbers, hyphens"
+    )]
     )
+
     company_name = models.CharField(
         max_length=200,
         help_text="Full company name like 'TechCorp Inc.'"
@@ -52,13 +59,15 @@ class TenantDatabaseInfo(models.Model):
     status = models.CharField(
         max_length=20,
         choices=[
+            ('PROVISIONING', 'Provisioning'),
             ('ACTIVE', 'Active'),
             ('SUSPENDED', 'Suspended'),
             ('INACTIVE', 'Inactive'),
+            ('PROVISIONING_FAILED', 'Provisioning Failed'),
         ],
         default='ACTIVE'
     )
-    
+
     # Timestamps
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)

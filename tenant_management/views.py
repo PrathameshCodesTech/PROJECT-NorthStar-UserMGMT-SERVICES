@@ -5,20 +5,31 @@ Tenant Management APIs - Service 2
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import IsAdminUser
 from django_filters.rest_framework import DjangoFilterBackend
 from django.shortcuts import get_object_or_404
 
 from .models import TenantDatabaseInfo
 from .tenant_utils import register_tenant_database, copy_framework_templates_via_service1
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from .tenant_utils import add_tenant_database_to_django, run_tenant_migrations_via_service1
+from django.core.exceptions import ValidationError
+from .validators import validate_and_normalize_slug
+
+
 
 
 class TenantManagementViewSet(viewsets.ViewSet):
     """
     Tenant Management APIs - Service 2
     Essential for production operations
+
     """
-    permission_classes = [AllowAny]  # TODO: Add SuperAdminPermission
+    permission_classes = [IsAdminUser]
+    authentication_classes = [JWTAuthentication]
+
+
+  # TODO: Add SuperAdminPermission
     
     def list(self, request):
         """List all tenants in the system"""
@@ -60,7 +71,11 @@ class TenantManagementViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['post'])
     def create_tenant(self, request):
         """Create new tenant with complete database provisioning"""
-        tenant_slug = request.data.get('tenant_slug')
+        try:
+            tenant_slug = validate_and_normalize_slug(request.data.get('tenant_slug'))
+        except ValidationError as e:
+            return Response({'success': False, 'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        framework_ids = request.data.get('framework_ids', None)
         company_name = request.data.get('company_name')
         subscription_plan = request.data.get('subscription_plan', 'BASIC')
         
@@ -72,23 +87,54 @@ class TenantManagementViewSet(viewsets.ViewSet):
             }, status=status.HTTP_400_BAD_REQUEST)
         
         # Check if tenant already exists
-        if TenantDatabaseInfo.objects.filter(tenant_slug=tenant_slug).exists():
+        existing = TenantDatabaseInfo.objects.filter(tenant_slug=tenant_slug).first()
+        if existing:
+            # Re-wire idempotently
+            connection_name = add_tenant_database_to_django(existing)
+            migration_success = run_tenant_migrations_via_service1(tenant_slug, connection_name)
+            # template_success = copy_framework_templates_via_service1(tenant_slug)
+            template_success = copy_framework_templates_via_service1(tenant_slug, framework_ids)
             return Response({
-                'success': False,
-                'error': f'Tenant with slug "{tenant_slug}" already exists'
-            }, status=status.HTTP_400_BAD_REQUEST)
+                'success': True,
+                'message': f'Tenant \"{existing.company_name}\" already existed; wiring refreshed.',
+                'tenant': {
+                    'tenant_slug': existing.tenant_slug,
+                    'company_name': existing.company_name,
+                    'database_name': existing.database_name,
+                    'subscription_plan': existing.subscription_plan,
+                    'status': existing.status,
+                    'created_at': existing.created_at
+                },
+                'provisioning': {
+                    'connection_name': connection_name,
+                    'migration_success': migration_success,
+                    'template_success': template_success,
+                    'steps': {
+                        'generate_credentials': {'ok': True, 'reused': True},
+                        'directory_row': {'ok': True, 'reused': True},
+                        'postgres_provision': {'ok': True, 'skipped': True},
+                        'django_alias': {'ok': True, 'connection_name': connection_name},
+                        'migrations': {'ok': bool(migration_success)},
+                        'templates': {'ok': bool(template_success), 'summary': template_success},
+                        'final_status': existing.status,
+                    }
+                }
+            }, status=status.HTTP_200_OK)
+
                 
         try:
             # Create tenant with complete database provisioning
             result = register_tenant_database(
                 tenant_slug=tenant_slug,
                 company_name=company_name,
-                subscription_plan=subscription_plan
+                subscription_plan=subscription_plan,
+                framework_ids=framework_ids,
             )
             
             # Extract tenant_info from result
+           # Extract tenant_info from result
             tenant_info = result['tenant_info']
-            
+
             return Response({
                 'success': True,
                 'message': f'Tenant "{company_name}" created successfully',
@@ -103,9 +149,11 @@ class TenantManagementViewSet(viewsets.ViewSet):
                 'provisioning': {
                     'connection_name': result['connection_name'],
                     'migration_success': result['migration_success'],
-                    'template_success': result['template_success']
+                    'template_success': result['template_success'],
+                    'steps': result['steps'],
                 }
             }, status=status.HTTP_201_CREATED)
+
         except Exception as e:
             return Response({
                 'success': False,
@@ -157,13 +205,20 @@ class TenantManagementViewSet(viewsets.ViewSet):
 
 class FrameworkDistributionViewSet(viewsets.ViewSet):
     """Framework Distribution APIs - Service 2"""
-    permission_classes = [AllowAny]
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAdminUser]
+
     
     @action(detail=False, methods=['post'])
     def distribute_to_tenant(self, request):
         """Distribute framework templates to specific tenant via Service 1"""
-        tenant_slug = request.data.get('tenant_slug')
+        try:
+            tenant_slug = validate_and_normalize_slug(request.data.get('tenant_slug'))
+        except ValidationError as e:
+            return Response({'success': False, 'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
         framework_ids = request.data.get('framework_ids', None)
+        
         
         if not tenant_slug:
             return Response({

@@ -8,6 +8,8 @@ from rest_framework import status
 from django.shortcuts import get_object_or_404
 from .models import TenantDatabaseInfo
 from .tenant_utils import get_tenant_database_credentials, register_tenant_database_alias_on_demand
+from django.conf import settings
+from rest_framework.permissions import AllowAny
 
 
 class InternalTenantCredentialsView(APIView):
@@ -15,17 +17,22 @@ class InternalTenantCredentialsView(APIView):
     Internal API for Service 1 to get tenant database credentials
     NEVER expose this publicly - only for service-to-service communication
     """
+    permission_classes = [AllowAny]
+    authentication_classes = [] 
     
     def get(self, request, tenant_slug):
         """Get decrypted database credentials for a tenant"""
         
         # TODO: Verify internal token
         internal_token = request.headers.get('X-Internal-Token')
-        if internal_token != 'service2-secret':  # TODO: Use proper auth
+        expected = getattr(settings, 'INTERNAL_REGISTER_DB_TOKEN', None)
+        if not expected or internal_token != expected:
             return Response(
-                {'error': 'Unauthorized - Internal API only'}, 
+                {'error': 'Unauthorized - Internal API only'},
                 status=status.HTTP_401_UNAUTHORIZED
             )
+
+
         
         # Get tenant credentials
         creds = get_tenant_database_credentials(tenant_slug)
@@ -44,17 +51,23 @@ class InternalTenantCredentialsView(APIView):
 
 class InternalTenantHealthView(APIView):
     """Check health of a tenant database connection"""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
     
     def post(self, request, tenant_slug):
         """Test tenant database connection"""
         
         # TODO: Verify internal token
         internal_token = request.headers.get('X-Internal-Token')
-        if internal_token != 'service2-secret':
+        expected = getattr(settings, 'INTERNAL_REGISTER_DB_TOKEN', None)
+        if not expected or internal_token != expected:
             return Response(
-                {'error': 'Unauthorized'}, 
+                {'error': 'Unauthorized - Internal API only'},
                 status=status.HTTP_401_UNAUTHORIZED
             )
+
+
         
         try:
             # Register alias if needed
